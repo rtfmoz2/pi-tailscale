@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Installed to /etc/systemd/system by install.sh.
+[Unit]
+Description=Re-check the Tailscale firewall rules every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

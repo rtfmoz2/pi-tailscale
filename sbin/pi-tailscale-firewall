@@ -1,0 +1,564 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""pi-tailscale-firewall: let SSH (and other chosen TCP ports) in over Tailscale,
+adding to whatever firewall the device already has, and only where it's needed.
+
+  pi-tailscale-firewall setup      apply, and also let nftables load our drop-in
+                                   (adds one include line to /etc/nftables.conf
+                                   if it doesn't include /etc/nftables.d already)
+  pi-tailscale-firewall apply      add the rules wherever they're missing (saved
+                                   config and the running firewall)
+  pi-tailscale-firewall refresh    rewrite the nftables drop-in only (run by
+                                   nftables.service before it loads)
+  pi-tailscale-firewall remove     take the rules out of the running firewall
+  pi-tailscale-firewall uninstall  remove, and delete every saved rule and file
+  pi-tailscale-firewall status     show the firewall and where the rules are
+
+What it adds, and where (saved, so it applies when that firewall is on, even
+if it's switched on later):
+  nftables      /etc/nftables.d/tailscale-00.nft, rules for each input chain
+                in /etc/nftables.conf that can drop packets
+  firewalld     its own zone file, /etc/firewalld/zones/pi-tailscale.xml
+  ufw           `ufw allow in on tailscale0 ...` rules, saved by ufw
+and in the running firewall, where something can drop the traffic:
+  nftables      each input filter chain that can drop packets
+  iptables      the INPUT chain (iptables and ip6tables), if it can drop packets
+With no firewall that could block Tailscale, nothing is added.
+The running-firewall rules are re-added by pi-tailscale-firewall.service
+whenever nftables.service or netfilter-persistent.service loads the firewall,
+and a timer re-checks every 5 minutes in case something else reloaded it.
+
+Each rule accepts the chosen TCP ports only when they arrive on the tailscale0
+interface, plus Tailscale's own UDP port (a direct path between devices
+instead of a relay). Rules carry the comment "pi-tailscale", so they can be
+found again and removed without touching anything else.
+
+Settings in /etc/default/pi-tailscale:  TCP_PORTS="22 80"
+The UDP port comes from PORT= in /etc/default/tailscaled (default 41641).
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+TAG = "pi-tailscale"
+IFACE = "tailscale0"
+CONF = "/etc/default/pi-tailscale"
+TAILSCALED_CONF = "/etc/default/tailscaled"
+IPTABLES_TABLES = {"filter", "mangle", "raw", "security", "nat"}
+os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin:" + os.environ.get("PATH", "")
+
+
+def read_vars(path: str) -> dict:
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'\s*([A-Z_]+)=["\']?([^"\'#]*)["\']?', line)
+                if m:
+                    out[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+    return out
+
+
+def settings():
+    tcp = [int(p) for p in re.split(r"[\s,]+", read_vars(CONF).get("TCP_PORTS", "22")) if p]
+    udp = int(read_vars(TAILSCALED_CONF).get("PORT") or 41641)
+    return tcp, udp
+
+
+def run(cmd, check=True, stdin=None):
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, input=stdin)
+
+
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+# ---- ufw --------------------------------------------------------------------
+
+def ufw_active() -> bool:
+    return have("ufw") and run(["ufw", "status"], check=False).stdout.startswith("Status: active")
+
+
+def ufw_ours() -> list:
+    """Our saved ufw rules (active or not), as arguments for `ufw delete`."""
+    out = []
+    for line in run(["ufw", "show", "added"], check=False).stdout.splitlines():
+        if line.startswith("ufw ") and f"comment '{TAG}'" in line:
+            out.append(shlex.split(line.split(" comment ")[0])[1:])
+    return out
+
+
+def ufw_apply(tcp, udp) -> list:
+    """Works whether ufw is on or off: rules saved while it's off apply once it's enabled."""
+    done = []
+    rules = [["allow", "in", "on", IFACE, "to", "any", "port", str(p), "proto", "tcp"] for p in tcp]
+    rules.append(["allow", "in", "to", "any", "port", str(udp), "proto", "udp"])
+    for r in rules:
+        out = run(["ufw", *r, "comment", TAG]).stdout
+        if "Skipping" not in out:
+            done.append("ufw " + " ".join(r) + ("" if ufw_active() else " (saved; applies when ufw is enabled)"))
+    return done
+
+
+def ufw_remove() -> list:
+    done = []
+    for r in ufw_ours():
+        run(["ufw", "delete", *r])
+        done.append("ufw " + " ".join(r))
+    return done
+
+
+# ---- firewalld ----------------------------------------------------------------
+
+FIREWALLD_ZONE = "/etc/firewalld/zones/pi-tailscale.xml"
+
+
+def firewalld_installed() -> bool:
+    return os.path.isdir("/etc/firewalld")
+
+
+def firewalld_running() -> bool:
+    return have("firewall-cmd") and run(["firewall-cmd", "--state"], check=False).stdout.strip() == "running"
+
+
+def firewalld_zone(tcp) -> str:
+    ports = "\n".join(f'  <port protocol="tcp" port="{p}"/>' for p in tcp)
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<!-- Added by pi-tailscale: the chosen TCP ports, only on the Tailscale interface. -->
+<zone>
+  <short>pi-tailscale</short>
+  <description>Tailscale interface: only the ports pi-tailscale opens.</description>
+  <interface name="{IFACE}"/>
+{ports}
+</zone>
+"""
+
+
+def firewalld_apply(tcp) -> list:
+    """A zone file of our own: firewalld reads it whenever it starts or reloads,
+    so it applies even if firewalld is switched on later. Tailscale's UDP port
+    is left out: it would mean editing the venue network's zone, and Tailscale
+    still finds a direct path through replies to its own packets."""
+    want = firewalld_zone(tcp)
+    try:
+        with open(FIREWALLD_ZONE) as f:
+            if f.read() == want:
+                return []
+    except OSError:
+        pass
+    with open(FIREWALLD_ZONE, "w") as f:
+        f.write(want)
+    os.chmod(FIREWALLD_ZONE, 0o644)
+    if firewalld_running():
+        run(["firewall-cmd", "--reload"])
+        return [f"firewalld zone {FIREWALLD_ZONE}"]
+    return [f"firewalld zone {FIREWALLD_ZONE} (saved; applies when firewalld starts)"]
+
+
+def firewalld_remove() -> list:
+    if not os.path.exists(FIREWALLD_ZONE):
+        return []
+    os.remove(FIREWALLD_ZONE)
+    if firewalld_running():
+        run(["firewall-cmd", "--reload"])
+    return [f"firewalld zone {FIREWALLD_ZONE}"]
+
+
+# ---- nftables (native tables) -----------------------------------------------------
+
+def nft_items():
+    if not have("nft"):
+        return []
+    r = run(["nft", "-j", "list", "ruleset"], check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    return json.loads(r.stdout).get("nftables", [])
+
+
+def is_iptables_chain(c) -> bool:
+    """Chains iptables-nft made (INPUT in ip/ip6 filter etc.): handled through iptables."""
+    return c["family"] in ("ip", "ip6") and c["table"] in IPTABLES_TABLES and c["name"].isupper()
+
+
+def verdicts(obj):
+    """Every verdict key (drop, reject, jump, goto, ...) anywhere in a rule's expressions."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("drop", "reject", "jump", "goto", "queue"):
+                yield k
+            yield from verdicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from verdicts(v)
+
+
+def nft_input_chains(items, skip_tables=()):
+    """Native input filter chains, each with its rules."""
+    chains = []
+    for it in items:
+        c = it.get("chain")
+        if (c and c.get("hook") == "input" and c.get("type") == "filter"
+                and c["family"] in ("ip", "ip6", "inet") and not is_iptables_chain(c)
+                and c["table"] not in skip_tables):
+            c = dict(c, rules=[])
+            chains.append(c)
+    for it in items:
+        r = it.get("rule")
+        if r:
+            for c in chains:
+                if (r["family"], r["table"], r["chain"]) == (c["family"], c["table"], c["name"]):
+                    c["rules"].append(r)
+    return chains
+
+
+def nft_can_drop(c) -> bool:
+    if c.get("policy") == "drop":
+        return True
+    return any(True for r in c["rules"] if r.get("comment") != TAG for _ in verdicts(r.get("expr", [])))
+
+
+def nft_rules(c, tcp, udp):
+    def port(n):
+        return n[0] if len(n) == 1 else {"set": n}
+    where = {"family": c["family"], "table": c["table"], "chain": c["name"], "comment": TAG}
+    iif = {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": IFACE}}
+    tcp_rule = dict(where, expr=[iif, {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                                                "right": port(tcp)}}, {"accept": None}])
+    udp_rule = dict(where, expr=[{"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}},
+                                            "right": udp}}, {"accept": None}])
+    return [tcp_rule, udp_rule]
+
+
+def nft_run(cmds):
+    run(["nft", "-j", "-f", "-"], stdin=json.dumps({"nftables": cmds}))
+
+
+def nft_apply(tcp, udp, skip_tables=()) -> list:
+    done = []
+    for c in nft_input_chains(nft_items(), skip_tables):
+        ours = [r for r in c["rules"] if r.get("comment") == TAG]
+        want = nft_rules(c, tcp, udp)
+        if not nft_can_drop(c):
+            continue
+        # Already right (same rules, e.g. loaded from the drop-in): nothing to do.
+        if sorted(json.dumps(r["expr"], sort_keys=True) for r in ours) == \
+                sorted(json.dumps(r["expr"], sort_keys=True) for r in want):
+            continue
+        # Missing, partly deleted or for other ports: replace ours, inserted at
+        # the top of the chain, ahead of whatever would drop the traffic.
+        cmds = [{"delete": {"rule": {"family": r["family"], "table": r["table"], "chain": r["chain"],
+                                     "handle": r["handle"]}}} for r in ours]
+        nft_run(cmds + [{"insert": {"rule": r}} for r in want])
+        done.append(f"nft {c['family']} {c['table']} {c['name']}")
+    return done
+
+
+def nft_remove() -> list:
+    done, cmds = [], []
+    for c in nft_input_chains(nft_items()):
+        for r in c["rules"]:
+            if r.get("comment") == TAG:
+                cmds.append({"delete": {"rule": {"family": r["family"], "table": r["table"],
+                                                 "chain": r["chain"], "handle": r["handle"]}}})
+                done.append(f"nft {c['family']} {c['table']} {c['name']} handle {r['handle']}")
+    if cmds:
+        nft_run(cmds)
+    return done
+
+
+# ---- nftables (saved config: /etc/nftables.d drop-in) --------------------------------
+
+NFT_CONF = "/etc/nftables.conf"
+NFT_DIR = "/etc/nftables.d"
+NFT_DROPIN = NFT_DIR + "/tailscale-00.nft"
+INCLUDE_MARK = "# added by pi-tailscale"
+INCLUDE_LINE = f'include "{NFT_DIR}/*.nft"  {INCLUDE_MARK}'
+SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write(path, text, mode=0o644):
+    tmp = path + ".pi-tailscale-new"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def nft_conf_includes_dir(text) -> bool:
+    return any(line.strip().startswith("include") and NFT_DIR + "/" in line
+               for line in text.splitlines())
+
+
+def nft_config_chains():
+    """The input chains /etc/nftables.conf defines, read by loading it into a
+    throwaway network namespace (the running firewall isn't touched). Our own
+    include line is left out, so a stale drop-in can't get in the way."""
+    text = read(NFT_CONF)
+    if text is None or not have("nft") or not have("unshare"):
+        return None
+    text = "\n".join(line for line in text.splitlines() if INCLUDE_MARK not in line) + "\n"
+    r = run(["unshare", "--net", "sh", "-c", "nft -f - && nft -j list ruleset"], check=False, stdin=text)
+    if r.returncode != 0:
+        print(f"warning: {NFT_CONF} doesn't load ({r.stderr.strip()}); drop-in left as it was", file=sys.stderr)
+        return None
+    return nft_input_chains(json.loads(r.stdout).get("nftables", []))
+
+
+def nft_dropin_text(chains, tcp, udp) -> str:
+    ports = str(tcp[0]) if len(tcp) == 1 else "{ " + ", ".join(map(str, tcp)) + " }"
+    out = [f"# Written by pi-tailscale-firewall; it rewrites this file from {NFT_CONF}",
+           "# whenever the firewall loads, so don't edit it by hand.",
+           f"# TCP {' '.join(map(str, tcp))} on {IFACE}, and Tailscale's UDP port {udp}, in each",
+           "# input chain that could otherwise drop them."]
+    rules = 0
+    for c in chains:
+        if not nft_can_drop(c):
+            continue
+        if not (SAFE_NAME.match(c["table"]) and SAFE_NAME.match(c["name"])):
+            print(f"warning: skipping nft chain with unusual name {c['table']!r} {c['name']!r}", file=sys.stderr)
+            continue
+        where = f"{c['family']} {c['table']} {c['name']}"
+        out.append(f'insert rule {where} udp dport {udp} accept comment "{TAG}"')
+        out.append(f'insert rule {where} iifname "{IFACE}" tcp dport {ports} accept comment "{TAG}"')
+        rules += 1
+    if not rules:
+        out.append("# Nothing needed: no input chain in the config can drop packets.")
+    return "\n".join(out) + "\n"
+
+
+def nft_refresh(tcp, udp) -> list:
+    """Rewrite the drop-in if nftables.conf includes /etc/nftables.d. Checked
+    with `nft -c` first; if the check fails, the previous file is put back."""
+    text = read(NFT_CONF)
+    if text is None or not nft_conf_includes_dir(text):
+        return []
+    chains = nft_config_chains()
+    if chains is None:
+        return []
+    want = nft_dropin_text(chains, tcp, udp)
+    old = read(NFT_DROPIN)
+    if old == want:
+        return []
+    os.makedirs(NFT_DIR, exist_ok=True)
+    write(NFT_DROPIN, want)
+    r = run(["nft", "-c", "-f", NFT_CONF], check=False)
+    if r.returncode != 0:
+        if old is None:
+            os.remove(NFT_DROPIN)
+        else:
+            write(NFT_DROPIN, old)
+        print(f"warning: new drop-in failed `nft -c` ({r.stderr.strip()}); kept the old one", file=sys.stderr)
+        return []
+    return [f"nftables drop-in {NFT_DROPIN}"]
+
+
+def nft_add_include() -> list:
+    """Make /etc/nftables.conf load /etc/nftables.d/*.nft (one line at the end),
+    unless it already does. Reverted if the result doesn't pass `nft -c`."""
+    text = read(NFT_CONF)
+    if text is None or not have("nft") or nft_conf_includes_dir(text):
+        return []
+    os.makedirs(NFT_DIR, exist_ok=True)
+    mode = os.stat(NFT_CONF).st_mode & 0o777
+    write(NFT_CONF, text + ("" if text.endswith("\n") else "\n") + "\n" + INCLUDE_LINE + "\n", mode)
+    r = run(["nft", "-c", "-f", NFT_CONF], check=False)
+    if r.returncode != 0:
+        write(NFT_CONF, text, mode)
+        print(f"warning: {NFT_CONF} with the include failed `nft -c` ({r.stderr.strip()}); left unchanged",
+              file=sys.stderr)
+        return []
+    return [f"include line in {NFT_CONF}"]
+
+
+def nft_remove_config() -> list:
+    done = []
+    text = read(NFT_CONF)
+    we_added = text is not None and INCLUDE_MARK in text
+    if we_added:
+        mode = os.stat(NFT_CONF).st_mode & 0o777
+        kept = [line for line in text.splitlines() if INCLUDE_MARK not in line]
+        while kept and not kept[-1].strip():
+            kept.pop()
+        write(NFT_CONF, "\n".join(kept) + "\n", mode)
+        done.append(f"include line in {NFT_CONF}")
+    if os.path.exists(NFT_DROPIN):
+        os.remove(NFT_DROPIN)
+        done.append(NFT_DROPIN)
+    if we_added:
+        try:
+            os.rmdir(NFT_DIR)  # we made it; only removed if nothing else is in it
+        except OSError:
+            pass
+    return done
+
+
+# ---- iptables / ip6tables -------------------------------------------------------------
+
+def iptables_cmds() -> list:
+    cmds = [c for c in ("iptables", "ip6tables") if have(c)]
+    # Legacy tables are only looked at if they're already in use (loaded).
+    if os.path.exists("/proc/net/ip_tables_names") and have("iptables-legacy") and "iptables-legacy" not in cmds:
+        if "legacy" not in run(["iptables", "-V"], check=False).stdout:
+            cmds.append("iptables-legacy")
+    if os.path.exists("/proc/net/ip6_tables_names") and have("ip6tables-legacy"):
+        if "legacy" not in run(["ip6tables", "-V"], check=False).stdout:
+            cmds.append("ip6tables-legacy")
+    return cmds
+
+
+def ipt_lines(cmd) -> list:
+    r = run([cmd, "-w", "-S", "INPUT"], check=False)
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def ipt_can_drop(lines) -> bool:
+    for line in lines:
+        if line == "-P INPUT DROP":
+            return True
+        if line.startswith("-A INPUT") and f"--comment {TAG}" not in line:
+            m = re.search(r"(?:-j|-g) (\S+)", line)
+            # Jumps into Tailscale's own chain or plain accepts/logs can't drop
+            # traffic arriving on tailscale0; anything else might.
+            if m and m.group(1) not in ("ACCEPT", "RETURN", "LOG", "ts-input"):
+                return True
+    return False
+
+
+def ipt_specs(tcp, udp):
+    tag = ["-m", "comment", "--comment", TAG, "-j", "ACCEPT"]
+    return [["-i", IFACE, "-p", "tcp", "-m", "multiport", "--dports", ",".join(map(str, tcp)), *tag],
+            ["-p", "udp", "--dport", str(udp), *tag]]
+
+
+def ipt_apply(tcp, udp) -> list:
+    done = []
+    for cmd in iptables_cmds():
+        lines = ipt_lines(cmd)
+        if not lines or not ipt_can_drop(lines):
+            continue
+        specs = ipt_specs(tcp, udp)
+        # Ours, but for other ports (TCP_PORTS changed): take out.
+        current = {"-A INPUT " + " ".join(s) for s in specs}
+        for line in lines:
+            if f"--comment {TAG}" in line and line not in current:
+                run([cmd, "-w", "-D", *shlex.split(line)[1:]])
+        for spec in reversed(specs):
+            if run([cmd, "-w", "-C", "INPUT", *spec], check=False).returncode != 0:
+                run([cmd, "-w", "-I", "INPUT", "1", *spec])
+                done.append(f"{cmd} INPUT {' '.join(spec[:-6])}")
+    return done
+
+
+def ipt_remove() -> list:
+    done = []
+    for cmd in iptables_cmds():
+        for line in ipt_lines(cmd):
+            if line.startswith("-A INPUT") and f"--comment {TAG}" in line:
+                run([cmd, "-w", "-D", *shlex.split(line)[1:]])
+                done.append(f"{cmd} {line}")
+    return done
+
+
+# ---- commands ---------------------------------------------------------------------------
+
+def report(verb, done):
+    for d in done:
+        print(f"{verb}: {d}")
+    return 0
+
+
+def apply(include=False) -> int:
+    tcp, udp = settings()
+    done = []
+    fwd = firewalld_running()
+    if firewalld_installed():
+        done += firewalld_apply(tcp)
+    # ufw installed: save the rules in ufw even while it's off. While it's on,
+    # it owns the iptables INPUT chain, so iptables is left to it.
+    if have("ufw"):
+        done += ufw_apply(tcp, udp)
+    if include:
+        done += nft_add_include()
+    done += nft_refresh(tcp, udp)
+    # Running firewall. firewalld's own nftables table is firewalld's to manage.
+    if not ufw_active() and not fwd:
+        done += ipt_apply(tcp, udp)
+    done += nft_apply(tcp, udp, skip_tables=("firewalld",) if fwd else ())
+    return report("added", done)
+
+
+def refresh() -> int:
+    return report("updated", nft_refresh(*settings()))
+
+
+def remove() -> int:
+    return report("removed", ipt_remove() + nft_remove())
+
+
+def uninstall() -> int:
+    done = ufw_remove() if have("ufw") else []
+    done += firewalld_remove() + nft_remove_config() + ipt_remove() + nft_remove()
+    return report("removed", done)
+
+
+def status() -> int:
+    tcp, udp = settings()
+    print(f"ports: TCP {' '.join(map(str, tcp))} on {IFACE}, UDP {udp}")
+    text = read(NFT_CONF)
+    if text is not None:
+        print(f"nftables config: {NFT_CONF} {'includes' if nft_conf_includes_dir(text) else 'does not include'} "
+              f"{NFT_DIR}; drop-in {'present' if os.path.exists(NFT_DROPIN) else 'absent'}")
+    if firewalld_installed():
+        print(f"firewalld: {'running' if firewalld_running() else 'installed, off'}, "
+              f"zone file {'present' if os.path.exists(FIREWALLD_ZONE) else 'absent'}")
+    if have("ufw"):
+        print(f"ufw: {'active' if ufw_active() else 'installed, off'}, {len(ufw_ours())} pi-tailscale rules saved")
+    for c in nft_input_chains(nft_items()):
+        ours = sum(1 for r in c["rules"] if r.get("comment") == TAG)
+        print(f"running nft {c['family']} {c['table']} {c['name']}: "
+              f"{'can drop' if nft_can_drop(c) else 'accepts everything'}, {ours} pi-tailscale rules")
+    if not ufw_active():
+        for cmd in iptables_cmds():
+            lines = ipt_lines(cmd)
+            if lines:
+                ours = sum(1 for line in lines if f"--comment {TAG}" in line)
+                print(f"running {cmd} INPUT: {'can drop' if ipt_can_drop(lines) else 'accepts everything'}, "
+                      f"{ours} pi-tailscale rules")
+    return 0
+
+
+COMMANDS = {"setup": lambda: apply(include=True), "apply": apply, "refresh": refresh,
+            "remove": remove, "uninstall": uninstall, "status": status}
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("run as root (sudo)", file=sys.stderr)
+        return 1
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd not in COMMANDS:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        return COMMANDS[cmd]()
+    except subprocess.CalledProcessError as e:
+        print(f"failed: {' '.join(e.cmd)}: {(e.stderr or '').strip()}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

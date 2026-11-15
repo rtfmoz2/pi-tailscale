@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Installed to /etc/systemd/system by install.sh; run by the timer of the same
+# name. Puts the Tailscale rules back if something reloaded the firewall
+# without going through nftables.service (e.g. `nft -f` by hand or a script).
+# Does nothing while pi-tailscale-firewall.service is stopped, and logs only
+# when it adds something.
+[Unit]
+Description=Re-check the Tailscale firewall rules
+After=pi-tailscale-firewall.service
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/systemctl --quiet is-active pi-tailscale-firewall.service
+ExecStart=/usr/local/sbin/pi-tailscale-firewall apply
+# Keep the routine every-5-minutes runs out of the journal: systemd's own
+# start/finish lines are "info" and filtered out, while this tool's output
+# (only printed when it adds something) is logged as "notice" and kept.
+SyslogLevel=notice
+LogLevelMax=notice

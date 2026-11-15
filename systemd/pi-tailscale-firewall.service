@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Installed to /etc/systemd/system by install.sh.
+#
+# Adds the Tailscale rules to the running firewall at boot, and again each
+# time nftables.service or netfilter-persistent.service (iptables-persistent)
+# starts, restarts or reloads, since each of those replaces the rules.
+# Neither needs to be installed or running; if one is switched on later, this
+# runs with it. Stopping this service takes the rules out again.
+[Unit]
+Description=Allow SSH over Tailscale in the device's firewall
+After=nftables.service netfilter-persistent.service ufw.service firewalld.service
+PartOf=nftables.service netfilter-persistent.service
+ReloadPropagatedFrom=nftables.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pi-tailscale-firewall apply
+ExecReload=/usr/local/sbin/pi-tailscale-firewall apply
+ExecStop=/usr/local/sbin/pi-tailscale-firewall remove
+
+[Install]
+WantedBy=multi-user.target nftables.service netfilter-persistent.service
